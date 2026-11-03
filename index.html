@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Event camera stream and gesture label of the EMMANUELA demo">
+<meta name="application-name" content="Gesture SNN">
+<meta name="mrbd-web-app-capable" content="yes">
+<title>Gesture SNN</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%235fd4ff'/%3E%3C/svg%3E">
+<style>
+  /* Meta Ray-Ban Display: 600 x 600 additive display, black = transparent. Bright marks on black, nothing else. */
+  :root { --on: #5fd4ff; --off: #ff8a3d; --text: #ffffff; --dim: #9aa4ad; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  main { box-sizing: border-box; height: 100%; display: flex; flex-direction: column;
+    justify-content: center; gap: 4vmin; padding: 4vmin; }
+  canvas { width: 100%; aspect-ratio: 16 / 9; image-rendering: pixelated; }
+  #label { font-size: 9vmin; font-weight: 700; line-height: 1.1; text-align: center; min-height: 1.1em; }
+  #label.none { color: var(--dim); font-weight: 500; }
+  #meta { font-size: 3.6vmin; color: var(--dim); text-align: center; min-height: 1.2em; }
+  #status { font-size: 3.2vmin; color: var(--dim); text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="events" width="160" height="90" aria-label="event camera, last 100 ms"></canvas>
+  <div id="label" class="none" aria-live="polite">connecting</div>
+  <div id="meta"></div>
+  <div id="status"></div>
+</main>
+<script>
+// Wire protocol of kria_server.py (emmanuela-kria/kria), so the same page works with the laptop replay
+// (kria/glasses/replay_server.py) and with SPLEAT on the Kria:
+//   binary  uint16 LE width, uint16 LE height, then either width*height bytes (0 none, 1 ON, 2 OFF)
+//           or the same pixels packed 2 bits each, 4 per byte, first pixel in the low bits (told apart by length)
+//   text    {"class": "Heart", "conf": 0.8, "model": "...", ...}
+// ?ws=wss://host/events connects elsewhere (page and stream on different hosts).
+const canvas = document.getElementById("events");
+const ctx = canvas.getContext("2d");
+const labelEl = document.getElementById("label");
+const metaEl = document.getElementById("meta");
+const statusEl = document.getElementById("status");
+const NONE = new Set(["no gesture", "do nothing", "none", "-", ""]);  // compared in lower case
+
+const css = getComputedStyle(document.documentElement);
+function rgb(hex) { const n = parseInt(hex.trim().slice(1), 16); return [n >> 16, (n >> 8) & 255, n & 255]; }
+const ON = rgb(css.getPropertyValue("--on")), OFF = rgb(css.getPropertyValue("--off"));
+
+let image = null, pending = null, frames = 0, bytes = 0, lastMsg = 0;
+
+function draw() {
+  const { w, h, px, packed } = pending;
+  if (!image || image.width !== w || image.height !== h) {
+    canvas.width = w; canvas.height = h; image = ctx.createImageData(w, h);
+  }
+  const d = image.data;
+  for (let i = 0; i < w * h; i++) {
+    const v = packed ? (px[i >> 2] >> ((i & 3) * 2)) & 3 : px[i];
+    const c = v === 1 ? ON : v === 2 ? OFF : null, o = i * 4;
+    if (c) { d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; } else { d[o] = d[o + 1] = d[o + 2] = 0; }
+    d[o + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+// Compressed frames (hello z: true) start with 0xFFFF (no real width), then zlib of a normal frame.
+const CAN_Z = typeof DecompressionStream === "function";
+let chain = Promise.resolve();  // decompression is async; the chain keeps frames in order
+function onBinary(buf) {
+  bytes += buf.byteLength;
+  const u = new Uint8Array(buf);
+  if (u[0] === 0xff && u[1] === 0xff) {
+    chain = chain
+      .then(() => new Response(new Blob([u.subarray(2)]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer())
+      .then(onFrame, () => ack());
+  } else {
+    onFrame(buf);
+  }
+}
+function ack() { if (ws && ws.readyState === 1) ws.send('{"cmd":"ack"}'); }  // flow control: server may send the next frame
+
+function onFrame(buf) {
+  const v = new DataView(buf), w = v.getUint16(0, true), h = v.getUint16(2, true), n = w * h;
+  const body = new Uint8Array(buf, 4);
+  let packed;
+  if (body.length === n) packed = false;
+  else if (body.length === Math.ceil(n / 4)) packed = true;
+  else { ack(); return; }
+  pending = { w, h, px: body, packed };
+  frames++;
+  draw();  // 10 frames/s of 160 x 90 pixels: cheap enough to draw on arrival
+  ack();
+}
+
+let rtt = null;
+function onText(s) {
+  let m; try { m = JSON.parse(s); } catch { return; }
+  if (m.pong !== undefined) { rtt = performance.now() - m.pong; return; }
+  if (m.class !== undefined) {
+    const none = NONE.has(String(m.class).toLowerCase());
+    labelEl.textContent = none ? "no gesture" : m.class;
+    labelEl.className = none ? "none" : "";
+  }
+  const bits = [];
+  if (m.phase) bits.push(m.phase);
+  if (m.model) bits.push(m.model);
+  metaEl.textContent = bits.join(" · ");
+}
+
+// Where the stream is: ?ws=... first; else config.json next to the page ({"ws": "wss://.../events"}, written by
+// glasses/tunnel.sh when the page is hosted on GitHub Pages and the stream comes through a tunnel); else the
+// page's own server (laptop or Kria serving the page and /events together).
+async function wsUrl() {
+  const q = new URLSearchParams(location.search).get("ws");
+  if (q) return q;
+  try {
+    const r = await fetch("config.json?t=" + Date.now(), { cache: "no-store" });
+    if (r.ok) { const c = await r.json(); if (c.ws) return c.ws; }
+  } catch { /* no config: same origin */ }
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/events";
+}
+
+let ws = null, retry = 1000;
+async function connect() {
+  const url = await wsUrl();
+  statusEl.textContent = "connecting to " + url.replace(/^wss?:\/\//, "").split("/")[0];
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    retry = 1000; statusEl.textContent = "connected";
+    // lite: packed frames, at most 10 per second; z: zlib (25x smaller on event frames);
+    // window 3: at most three frames on the way, so tunnel and phone buffers cannot queue up old frames
+    ws.send(JSON.stringify({ cmd: "hello", lite: true, z: CAN_Z, window: 3 }));
+  };
+  ws.onmessage = (e) => { lastMsg = performance.now(); typeof e.data === "string" ? onText(e.data) : onBinary(e.data); };
+  ws.onclose = () => {
+    statusEl.textContent = "reconnecting";
+    setTimeout(connect, retry); retry = Math.min(retry * 2, 10000);
+  };
+}
+connect();
+
+setInterval(() => {  // round trip glasses -> server -> glasses
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ cmd: "ping", t: performance.now() }));
+}, 2000);
+
+setInterval(() => {  // once a second: frame rate, data rate and round trip, so a slow link is visible on the glasses
+  if (ws && ws.readyState === 1) {
+    const stale = performance.now() - lastMsg > 3000;
+    const r = rtt === null ? "" : ` · ${Math.round(rtt)} ms`;
+    statusEl.textContent = stale ? "connected, no data" : `${frames} frames/s · ${(bytes / 1024).toFixed(1)} KB/s${r}`;
+  }
+  frames = 0; bytes = 0;
+}, 1000);
+
+// Neural Band / D-pad arrive as keydown. Right: next stream, Left: restart the current one (replay only).
+addEventListener("keydown", (e) => {
+  const cmd = { ArrowRight: "next", ArrowLeft: "restart" }[e.key];
+  if (cmd && ws && ws.readyState === 1) { ws.send(JSON.stringify({ cmd })); e.preventDefault(); }
+});
+</script>
+</body>
+</html>
