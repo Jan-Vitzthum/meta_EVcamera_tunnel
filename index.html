@@ -123,8 +123,10 @@ async function wsUrl() {
 
 let ws = null, retry = 1000;
 async function connect() {
-  const url = await wsUrl();
-  statusEl.textContent = "connecting to " + url.replace(/^wss?:\/\//, "").split("/")[0];
+  const base = await wsUrl();
+  statusEl.textContent = "connecting to " + base.replace(/^wss?:\/\//, "").split("/")[0];
+  // settings in the URL as well as in hello: the URL always arrives, client messages through a tunnel may not
+  const url = base + (base.includes("?") ? "&" : "?") + `lite=1&z=${CAN_Z ? 1 : 0}&window=3`;
   ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
